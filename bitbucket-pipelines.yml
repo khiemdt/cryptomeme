@@ -1,0 +1,59 @@
+options:
+  docker: true
+
+definitions:
+  services:
+    docker:
+      memory: 2048
+  scripts: 
+    setCommonEnv: &setCommonEnvScript
+      if [ -f env.sh ]; then source env.sh && cat env.sh ; fi && 
+      export IMAGE_NAME="${DOCKER_REGISTRY}/${BITBUCKET_REPO_FULL_NAME}" &&
+      export IMAGE_TAG=$([[ ! -z "${BITBUCKET_TAG}" ]] && echo "${BITBUCKET_TAG}" || echo "${BITBUCKET_BRANCH}-${BITBUCKET_BUILD_NUMBER}") &&
+      export FULL_IMAGE_NAME="${IMAGE_NAME}:${IMAGE_TAG}" &&
+      export DOCKER_BUILD_ARGS=$(cat .ci/docker_args.envrc 2>/dev/null | sed 's/^/--build-arg /') &&
+
+      export TMP_IMAGE_ARTIFACT="tmp.docker"
+
+    authGcp: &authGcpScript
+      echo ${GCLOUD_API_KEYFILE} | base64 -d > ./gcloud-api-key.json &&
+      gcloud auth activate-service-account --key-file gcloud-api-key.json &&
+      gcloud config set project $GCLOUD_ARTIFACT_REGISTRY_PROJECT &&
+      echo "MAVEN_USERNAME=_json_key_base64" >> docker_args.envrc &&
+      echo "MAVEN_PASSWORD=${GCLOUD_API_KEYFILE}" >> docker_args.envrc
+
+  steps:
+    - step: &buildDockerStep
+        name: Push to GCP registry
+        image: google/cloud-sdk:alpine
+        script:
+          - *setCommonEnvScript
+          - *authGcpScript
+          - export DOCKER_BUILDKIT=0
+          - if [[ -f docker_args.envrc ]]; then export DOCKER_BUILD_ARGS=$(cat docker_args.envrc | sed 's@^@--build-arg @g' | paste -s -d " "); fi
+          - echo ${DOCKER_BUILD_ARGS}
+          - gcloud auth configure-docker ${DOCKER_REGISTRY_REGION}-docker.pkg.dev
+          - |-
+              docker build . \
+                ${DOCKER_BUILD_ARGS} --build-arg BUILDKIT_INLINE_CACHE=1 \
+                --cache-from ${IMAGE_NAME}:${BITBUCKET_BRANCH} \
+                -t ${FULL_IMAGE_NAME} -t ${IMAGE_NAME}:${BITBUCKET_BRANCH}
+          - docker push ${FULL_IMAGE_NAME} && docker push ${IMAGE_NAME}:${BITBUCKET_BRANCH}
+        services:
+          - docker
+
+pipelines:
+  tags:
+    v*:
+      - step: *buildDockerStep
+        deployment: production
+
+  branches:
+    dev:
+      - step: *buildDockerStep
+        deployment: development
+
+
+    master:
+      - step: *buildDockerStep
+        deployment: production
